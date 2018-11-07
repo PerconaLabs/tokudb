@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -3022,6 +3022,7 @@ fil_reinit_space_header_for_table(
 	they won't violate the latch ordering. */
 	dict_table_x_unlock_indexes(table);
 	row_mysql_unlock_data_dictionary(trx);
+	DEBUG_SYNC_C("trunc_table_index_dropped_release_dict_lock");
 
 	/* Lock the search latch in shared mode to prevent user
 	from disabling AHI during the scan */
@@ -3539,7 +3540,7 @@ fil_ibd_create(
 	bool		has_shared_space = FSP_FLAGS_GET_SHARED(flags);
 	fil_space_t*	space = NULL;
 
-	ut_ad(!is_system_tablespace(space_id));
+	ut_ad(!is_shared_system_tablespace(space_id));
 	ut_ad(!srv_read_only_mode);
 	ut_a(space_id < SRV_LOG_SPACE_FIRST_ID);
 	ut_a(size >= FIL_IBD_FILE_INITIAL_SIZE);
@@ -5096,24 +5097,40 @@ retry:
 
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
 		int     ret = posix_fallocate(node->handle.m_file, node_start, len);
-		/* We already pass the valid offset and len in, if EINVAL
-		is returned, it could only mean that the file system doesn't
-		support fallocate(), currently one known case is
-		ext3 FS with O_DIRECT. We ignore EINVAL here so that the
-		error message won't flood. */
-		if (ret != 0 && ret != EINVAL) {
-			ib::error()
-				<< "posix_fallocate(): Failed to preallocate"
-				" data for file "
-				<< node->name << ", desired size "
-				<< len << " bytes."
-				" Operating system error number "
-				<< ret << ". Check"
-				" that the disk is not full or a disk quota"
-				" exceeded. Make sure the file system supports"
-				" this function. Some operating system error"
-				" numbers are described at " REFMAN
-				" operating-system-error-codes.html";
+
+		DBUG_EXECUTE_IF("ib_posix_fallocate_fail_eintr",
+				ret = EINTR;);
+
+		DBUG_EXECUTE_IF("ib_posix_fallocate_fail_einval",
+				ret = EINVAL;);
+
+		if (ret != 0) {
+			/* We already pass the valid offset and len in,
+			if EINVAL is returned, it could only mean that the
+			file system doesn't support fallocate(), currently
+			one known case is ext3 with O_DIRECT.
+
+			Also because above call could be interrupted,
+			in this case, simply go to plan B by writing zeroes.
+
+			Both error messages for above two scenarios are
+			skipped in case of flooding error messages, because
+			they can be ignored by users. */
+			if (ret != EINTR && ret != EINVAL) {
+				ib::error()
+					<< "posix_fallocate(): Failed to"
+					" preallocate data for file "
+					<< node->name << ", desired size "
+					<< len << " bytes."
+					" Operating system error number "
+					<< ret << ". Check"
+					" that the disk is not full or a disk"
+					" quota exceeded. Make sure the file"
+					" system supports this function."
+					" Some operating system error"
+					" numbers are described at " REFMAN
+					"operating-system-error-codes.html";
+			}
 
 			err = DB_IO_ERROR;
 		}
@@ -5471,18 +5488,49 @@ fil_io_set_encryption(
 	const page_id_t&	page_id,
 	fil_space_t*		space)
 {
-	/* Don't encrypt the log, page 0 of all tablespaces, all pages
-	from the system tablespace. */
-	if (!req_type.is_log() && page_id.page_no() > 0
-	    && space->encryption_type != Encryption::NONE)
-	{
-		req_type.encryption_key(space->encryption_key,
-					space->encryption_klen,
-					space->encryption_iv);
-		req_type.encryption_algorithm(Encryption::AES);
-	} else {
+
+	/* Explicit request to disable encryption */
+	if (req_type.is_encryption_disabled()) {
 		req_type.clear_encrypted();
+		return;
 	}
+
+	/* Don't encrypt pages of system tablespace upto
+	TRX_SYS_PAGE(including). The doublewrite buffer
+	header is on TRX_SYS_PAGE */
+	if (is_shared_system_tablespace(space->id)
+	    && page_id.page_no() <= FSP_TRX_SYS_PAGE_NO) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	/* Don't encrypt redo log and system tablespaces,
+	for all the other types tablespaces, don't encrypt page 0. */
+	if (space->encryption_type == Encryption::NONE
+	    || (page_id.page_no() == 0 && !req_type.is_log())) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	/* For writing redo log, if encryption for redo log is disabled,
+	skip setting encryption. */
+	if (req_type.is_log() && req_type.is_write()) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	/* For writing temporary tablespace, if encryption for temporary
+	tablespace is disabled, skip setting encryption. */
+	if (fsp_is_system_temporary(space->id)
+	    && !srv_tmp_tablespace_encrypt && req_type.is_write()) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	req_type.encryption_key(space->encryption_key,
+				space->encryption_klen,
+				space->encryption_iv);
+	req_type.encryption_algorithm(Encryption::AES);
 }
 
 /** Reads or writes data. This operation could be asynchronous (aio).
@@ -5526,7 +5574,6 @@ _fil_io(
 	os_offset_t		offset;
 	IORequest		req_type(type);
 
-	ut_ad(!trx || trx->take_stats);
 	ut_ad(req_type.validate());
 
 	ut_ad(len > 0);
@@ -5721,6 +5768,9 @@ _fil_io(
 			space->name, byte_offset, len, req_type.is_read());
 	}
 
+	/* Set encryption information. */
+	fil_io_set_encryption(req_type, page_id, space);
+
 	/* Now we have made the changes in the data structures of fil_system */
 	mutex_exit(&fil_system->mutex);
 
@@ -5808,9 +5858,6 @@ _fil_io(
 	} else {
 		req_type.clear_compressed();
 	}
-
-	/* Set encryption information. */
-	fil_io_set_encryption(req_type, page_id, space);
 
 	req_type.block_size(node->block_size);
 
@@ -6969,8 +7016,9 @@ fil_space_validate_for_mtr_commit(
 {
 	ut_ad(!mutex_own(&fil_system->mutex));
 	ut_ad(space != NULL);
-	ut_ad(space->purpose == FIL_TYPE_TABLESPACE);
-	ut_ad(!is_predefined_tablespace(space->id));
+	ut_ad(space->purpose == FIL_TYPE_TABLESPACE ||
+		space->purpose == FIL_TYPE_TEMPORARY);
+	ut_ad(!is_shared_system_tablespace(space->id));
 
 	/* We are serving mtr_commit(). While there is an active
 	mini-transaction, we should have !space->stop_new_ops. This is
@@ -7354,12 +7402,6 @@ fil_set_encryption(
 	byte*			key,
 	byte*			iv)
 {
-	ut_ad(!is_system_or_undo_tablespace(space_id));
-
-	if (is_system_tablespace(space_id)) {
-		return(DB_IO_NO_ENCRYPT_TABLESPACE);
-	}
-
 	mutex_enter(&fil_system->mutex);
 
 	fil_space_t*	space = fil_space_get_by_id(space_id);
@@ -7371,6 +7413,8 @@ fil_set_encryption(
 
 	ut_ad(algorithm != Encryption::NONE);
 	space->encryption_type = algorithm;
+	space->flags |= FSP_FLAGS_MASK_ENCRYPTION;
+
 	if (key == NULL) {
 		Encryption::random_value(space->encryption_key);
 	} else {
@@ -7391,6 +7435,40 @@ fil_set_encryption(
 	return(DB_SUCCESS);
 }
 
+/** Enable encryption of temporary tablespace
+@param[in,out]	space	tablespace object
+@return DB_SUCCESS on success, DB_ERROR on failure */
+dberr_t
+fil_temp_update_encryption(
+	fil_space_t*	space)
+{
+	/* Make sure the keyring is loaded. */
+	if (!Encryption::check_keyring()) {
+		ib::error() << "Can't set temporary tablespace"
+			<< " to be encrypted because"
+			<< " keyring plugin is not"
+			<< " available.";
+			return(DB_ERROR);
+	}
+
+	if (!fsp_enable_encryption(space)) {
+		ib::error() << "Can't set temporary tablespace"
+			<< " to be encrypted.";
+		return(DB_ERROR);
+	}
+
+	dberr_t	err = fil_set_encryption(
+		space->id,
+		Encryption::AES, NULL, NULL);
+
+	ut_ad(err == DB_SUCCESS);
+
+	return(err);
+}
+
+/** Default master key id for bootstrap */
+static const ulint ENCRYPTION_DEFAULT_MASTER_KEY_ID = 0;
+
 /** Rotate the tablespace keys by new master key.
 @return true if the re-encrypt suceeds */
 bool
@@ -7403,15 +7481,30 @@ fil_encryption_rotate()
 	for (space = UT_LIST_GET_FIRST(fil_system->space_list);
 	     space != NULL; ) {
 		/* Skip unencypted tablespaces. */
-		if (is_system_or_undo_tablespace(space->id)
-		    || fsp_is_system_temporary(space->id)
+		if (srv_is_undo_tablespace(space->id)
 		    || space->purpose == FIL_TYPE_LOG) {
+			space = UT_LIST_GET_NEXT(space_list, space);
+			continue;
+		}
+
+		/* Skip the temporary tablespace when it's in default
+		key status, since it's the first server startup
+		after bootstrap, and the server uuid is not ready
+		yet. */
+		if (fsp_is_system_temporary(space->id)
+		    && Encryption::master_key_id ==
+			ENCRYPTION_DEFAULT_MASTER_KEY_ID) {
 			space = UT_LIST_GET_NEXT(space_list, space);
 			continue;
 		}
 
 		if (space->encryption_type != Encryption::NONE) {
 			mtr_start(&mtr);
+
+			if (fsp_is_system_temporary(space->id)) {
+				mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+			}
+
 			mtr.set_named_space(space->id);
 
 			space = mtr_x_lock_space(space->id, &mtr);

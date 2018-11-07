@@ -42,6 +42,7 @@ Created 10/21/1995 Heikki Tuuri
 #include <sys/stat.h>
 #include <time.h>
 #endif /* !_WIN32 */
+#include "page0types.h"
 
 /** File node of a tablespace or the log data space */
 struct fil_node_t;
@@ -448,10 +449,16 @@ struct Encryption {
         static const char* to_string(Type type)
 		MY_ATTRIBUTE((warn_unused_result));
 
-        /** Check if the string is "empty" or "none".
-        @param[in]      algorithm       Encryption algorithm to check
-        @return true if no algorithm requested */
+	/** Check if the string is "" or "n".
+	@param[in]      algorithm       Encryption algorithm to check
+	@return true if no algorithm requested */
 	static bool is_none(const char* algorithm)
+		MY_ATTRIBUTE((warn_unused_result));
+
+	/** Check if the NO algorithm was explicitly specified.
+	@param[in]      algorithm       Encryption algorithm to check
+	@return true if no algorithm explicitly requested */
+	static bool none_explicitly_specified(const char* algorithm)
 		MY_ATTRIBUTE((warn_unused_result));
 
         /** Generate random encryption value for key and iv.
@@ -513,6 +520,11 @@ struct Encryption {
 		byte*			dst,
 		ulint			dst_len)
 		MY_ATTRIBUTE((warn_unused_result));
+
+#ifndef UNIV_INNOCHECKSUM
+	/** Check if keyring plugin loaded. */
+	static bool MY_ATTRIBUTE((warn_unused_result)) check_keyring();
+#endif
 
 	/** Encrypt type */
 	Type			m_type;
@@ -584,7 +596,10 @@ public:
 		This can be used to force a read and write without any
 		compression e.g., for redo log, merge sort temporary files
 		and the truncate redo log. */
-		NO_COMPRESSION = 512
+		NO_COMPRESSION = 512,
+
+		/** Force write of decrypted pages in encrypted tablespace. */
+		NO_ENCRYPTION = 1024
 	};
 
 	/** Default constructor */
@@ -776,10 +791,22 @@ public:
 		return((m_type & NO_COMPRESSION) == 0);
 	}
 
+	/** @return true if the page write should not be encrypted */
+	bool is_encryption_disabled() const MY_NODISCARD
+	{
+		return((m_type & NO_ENCRYPTION) != 0);
+	}
+
 	/** Disable transformations. */
 	void disable_compression()
 	{
 		m_type |= NO_COMPRESSION;
+	}
+
+	/** Disable encryption of a page in encrypted tablespace */
+	void disable_encryption()
+        {
+		m_type |= NO_ENCRYPTION;
 	}
 
 	/** Set encryption algorithm
@@ -1197,12 +1224,12 @@ do {									\
 		state, locker, key, op, name,				\
 		src_file, static_cast<uint>(src_line))			\
 
-# define register_pfs_file_rename_end(locker, result)			\
+# define register_pfs_file_rename_end(locker, from, to, result)		\
 do {									\
 	if (locker != NULL) {						\
 		 PSI_FILE_CALL(						\
-			end_file_open_wait)(				\
-			locker, result);				\
+			end_file_rename_wait)(				\
+			locker, from, to, result);			\
 	}								\
 }while(0)
 
@@ -2315,6 +2342,35 @@ is_absolute_path(
 /** Submit buffered AIO requests on the given segment to the kernel. */
 void
 os_aio_dispatch_read_array_submit();
+
+struct fil_space_t;
+
+/** Encrypt a doublewrite buffer page. The page is encrypted
+using the key of tablespace object provided.
+Caller should allocate buffer for encrypted page
+@param[in]	space			tablespace object
+@param[in]	in_page			unencrypted page
+@param[in,out]	encrypted_buf		buffer to hold the encrypted page
+@param[in]	encrypted_buf_len	length of the encrypted buffer
+@return true on success, false on failure */
+bool
+os_dblwr_encrypt_page(
+	fil_space_t*	space,
+	page_t*		in_page,
+	page_t*		encrypted_buf,
+	ulint		encrypted_buf_len);
+
+/** Decrypt a page from doublewrite buffer. Tablespace object
+(fil_space_t) must have encryption key, iv set properly.
+The decrpyted page will be written in the same buffer of input page.
+@param[in]	space	tablespace obejct
+@param[in,out]	page	in: encrypted page
+			out: decrypted page
+@return DB_SUCCESS on success, others on failure */
+dberr_t
+os_dblwr_decrypt_page(
+	fil_space_t*		space,
+	page_t*			in_page);
 
 #ifndef UNIV_NONINL
 #include "os0file.ic"

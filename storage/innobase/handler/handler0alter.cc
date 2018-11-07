@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2005, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2005, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -110,7 +110,8 @@ static const Alter_inplace_info::HA_ALTER_FLAGS INNOBASE_ALTER_NOREBUILD
 	| Alter_inplace_info::ALTER_INDEX_COMMENT
 	| Alter_inplace_info::ADD_VIRTUAL_COLUMN
 	| Alter_inplace_info::DROP_VIRTUAL_COLUMN
-	| Alter_inplace_info::ALTER_VIRTUAL_COLUMN_ORDER;
+	| Alter_inplace_info::ALTER_VIRTUAL_COLUMN_ORDER
+        | Alter_inplace_info::ALTER_COLUMN_INDEX_LENGTH;
 	/* | Alter_inplace_info::ALTER_VIRTUAL_COLUMN_TYPE; */
 
 struct ha_innobase_inplace_ctx : public inplace_alter_handler_ctx
@@ -556,11 +557,11 @@ ha_innobase::check_if_supported_inplace_alter(
 
 	/* We don't support change encryption attribute with
 	inplace algorithm. */
-	char*	old_encryption = this->table->s->encrypt_type.str;
+	const bool currently_encrypted =
+		m_prebuilt->table->flags2 & DICT_TF2_ENCRYPTION;
 	char*	new_encryption = altered_table->s->encrypt_type.str;
 
-	if (Encryption::is_none(old_encryption)
-	    != Encryption::is_none(new_encryption)) {
+	if (currently_encrypted == Encryption::is_none(new_encryption)) {
 		ha_alter_info->unsupported_reason =
 			innobase_get_err_msg(
 				ER_UNSUPPORTED_ALTER_ENCRYPTION_INPLACE);
@@ -4258,6 +4259,19 @@ prepare_inplace_alter_table_dict(
 		for create index */
 		if (ha_alter_info->handler_flags
 		    & Alter_inplace_info::ADD_INDEX) {
+                        for (ulint i = 0;
+                             i < ctx->num_to_add_vcol;
+                             i++) {
+                                /* Set mbminmax for newly added column */
+                                ulint   i_mbminlen, i_mbmaxlen;
+                                dtype_get_mblen(ctx->add_vcol[i].m_col.mtype,
+                                                ctx->add_vcol[i].m_col.prtype,
+                                                &i_mbminlen, &i_mbmaxlen);
+
+				dtype_set_mbminmaxlen(
+					(dtype_t*) &ctx->add_vcol[i].m_col,
+					i_mbminlen, i_mbmaxlen);
+                        }
 			add_v = static_cast<dict_add_v_col_t*>(
 				mem_heap_alloc(ctx->heap, sizeof *add_v));
 			add_v->n_v_col = ctx->num_to_add_vcol;
@@ -4653,7 +4667,7 @@ prepare_inplace_alter_table_dict(
 				ctx->old_table->name.m_name);
 
 			error = DB_SUCCESS;
-			// fallthrough
+			// Fall through.
 
 		case DB_SUCCESS:
 			/* We need to bump up the table ref count and
@@ -5353,18 +5367,24 @@ alter_fill_stored_column(
 	dict_s_col_list**	s_cols,
 	mem_heap_t**		s_heap)
 {
-       ulint   n_cols = altered_table->s->fields;
+	ulint   n_cols = altered_table->s->fields;
+	ulint	stored_col_no = 0;
 
 	for (ulint i = 0; i < n_cols; i++) {
 		Field* field = altered_table->field[i];
 		dict_s_col_t	s_col;
+
+		if (!innobase_is_v_fld(field)) {
+			stored_col_no++;
+		}
 
 		if (!innobase_is_s_fld(field)) {
 			continue;
 		}
 
 		ulint	num_base = field->gcol_info->non_virtual_base_columns();
-		dict_col_t*	col = dict_table_get_nth_col(table, i);
+		dict_col_t*	col
+			= dict_table_get_nth_col(table, stored_col_no);
 
 		s_col.m_col = col;
 		s_col.s_pos = i;
@@ -5428,6 +5448,7 @@ ha_innobase::prepare_inplace_alter_table(
 	bool		add_fts_idx		= false;
 	dict_s_col_list*s_cols			= NULL;
 	mem_heap_t*	s_heap			= NULL;
+	ulint		encrypt_flag		= 0;
 
 	DBUG_ENTER("prepare_inplace_alter_table");
 	DBUG_ASSERT(!ha_alter_info->handler_ctx);
@@ -5603,6 +5624,31 @@ check_if_ok_to_rename:
 
 	if (!info.innobase_table_flags()) {
 		goto err_exit_no_heap;
+	}
+
+	/* create_table_info_t::innobase_table_flags does not set encryption
+	flags. There are places where it is done afterwards, there are places
+	where it isn't done. We need to inspect all code paths and check if
+	encryption flag can be set in one place. */
+	if (!Encryption::is_none(
+		ha_alter_info->create_info->encrypt_type.str)) {
+
+		/* Set the encryption flag. */
+		byte*			master_key = NULL;
+		ulint			master_key_id;
+		Encryption::Version	version;
+
+		/* Check if keyring is ready. */
+		Encryption::get_master_key(&master_key_id,
+					   &master_key,
+					   &version);
+
+		if (master_key == NULL) {
+			goto err_exit_no_heap;
+		} else {
+			my_free(master_key);
+			encrypt_flag = DICT_TF2_ENCRYPTION;
+		}
 	}
 
 	max_col_len = DICT_MAX_FIELD_LEN_BY_FORMAT_FLAG(info.flags());
@@ -6118,7 +6164,7 @@ found_col:
 	DBUG_RETURN(prepare_inplace_alter_table_dict(
 			    ha_alter_info, altered_table, table,
 			    table_share->table_name.str,
-			    info.flags(), info.flags2(),
+			    info.flags(), info.flags2() | encrypt_flag,
 			    fts_doc_col_no, add_fts_doc_id,
 			    add_fts_doc_id_idx, m_prebuilt));
 }
@@ -7221,13 +7267,15 @@ innobase_rename_or_enlarge_columns_cache(
 }
 
 /** Get the auto-increment value of the table on commit.
-@param ha_alter_info Data used during in-place alter
-@param ctx In-place ALTER TABLE context
-@param altered_table MySQL table that is being altered
-@param old_table MySQL table as it is before the ALTER operation
-@return the next auto-increment value (0 if not present) */
+@param[in]  ha_alter_info Data used during in-place alter
+@param[in,out]  ctx In-place ALTER TABLE context.
+		return autoinc value in ctx->max_autoinc
+@param[in]  altered_table MySQL table that is being altered
+@param[in]  old_table MySQL table as it is before the ALTER operation
+@retval true Failure
+@retval false Success*/
 static MY_ATTRIBUTE((warn_unused_result))
-ulonglong
+bool
 commit_get_autoinc(
 /*===============*/
 	Alter_inplace_info*	ha_alter_info,
@@ -7235,23 +7283,27 @@ commit_get_autoinc(
 	const TABLE*		altered_table,
 	const TABLE*		old_table)
 {
-	ulonglong		max_autoinc;
-
 	DBUG_ENTER("commit_get_autoinc");
 
 	if (!altered_table->found_next_number_field) {
 		/* There is no AUTO_INCREMENT column in the table
 		after the ALTER operation. */
-		max_autoinc = 0;
+		ctx->max_autoinc = 0;
 	} else if (ctx->add_autoinc != ULINT_UNDEFINED) {
 		/* An AUTO_INCREMENT column was added. Get the last
 		value from the sequence, which may be based on a
 		supplied AUTO_INCREMENT value. */
-		max_autoinc = ctx->sequence.last();
+		ctx->max_autoinc = ctx->sequence.last();
 	} else if ((ha_alter_info->handler_flags
 		    & Alter_inplace_info::CHANGE_CREATE_OPTION)
 		   && (ha_alter_info->create_info->used_fields
 		       & HA_CREATE_USED_AUTO)) {
+
+		/* Check if the table is discarded */
+		if(dict_table_is_discarded(ctx->old_table)) {
+			DBUG_RETURN(true);
+		}
+
 		/* An AUTO_INCREMENT value was supplied, but the table was not
 		rebuilt. Get the user-supplied value or the last value from the
 		sequence. */
@@ -7264,7 +7316,8 @@ commit_get_autoinc(
 		dict_index_t*	index = dict_table_get_index_on_first_col(
 			ctx->old_table, autoinc_field->field_index);
 
-		max_autoinc = ha_alter_info->create_info->auto_increment_value;
+		ctx->max_autoinc =
+			ha_alter_info->create_info->auto_increment_value;
 
 		dict_table_autoinc_lock(ctx->old_table);
 
@@ -7273,15 +7326,15 @@ commit_get_autoinc(
 
 		if (err != DB_SUCCESS) {
 			ut_ad(0);
-			max_autoinc = 0;
-		} else if (max_autoinc <= max_value_table) {
+			ctx->max_autoinc = 0;
+		} else if (ctx->max_autoinc <= max_value_table) {
 			ulonglong	col_max_value;
 			ulonglong	offset;
 
 			col_max_value = autoinc_field->get_max_int_value();
 
 			offset = ctx->prebuilt->autoinc_offset;
-			max_autoinc = innobase_next_autoinc(
+			ctx->max_autoinc = innobase_next_autoinc(
 				max_value_table, 1, 1, offset,
 				col_max_value);
 		}
@@ -7291,11 +7344,11 @@ commit_get_autoinc(
 		Read the old counter value from the table. */
 		ut_ad(old_table->found_next_number_field);
 		dict_table_autoinc_lock(ctx->old_table);
-		max_autoinc = ctx->old_table->autoinc;
+		ctx->max_autoinc = ctx->old_table->autoinc;
 		dict_table_autoinc_unlock(ctx->old_table);
 	}
 
-	DBUG_RETURN(max_autoinc);
+	DBUG_RETURN(false);
 }
 
 /** Add or drop foreign key constraints to the data dictionary tables,
@@ -8323,24 +8376,24 @@ ha_innobase::commit_inplace_alter_table(
 	trx_t*		trx		= ctx0->trx;
 	bool		fail		= false;
 
-	if (new_clustered) {
-		for (inplace_alter_handler_ctx** pctx = ctx_array;
-		     *pctx; pctx++) {
-			ha_innobase_inplace_ctx*	ctx
-				= static_cast<ha_innobase_inplace_ctx*>(*pctx);
-			DBUG_ASSERT(ctx->need_rebuild());
+	/* Stop background FTS operations. */
+	for (inplace_alter_handler_ctx** pctx = ctx_array;
+			 *pctx; pctx++) {
+		ha_innobase_inplace_ctx*	ctx
+			= static_cast<ha_innobase_inplace_ctx*>(*pctx);
 
+		DBUG_ASSERT(new_clustered == ctx->need_rebuild());
+
+		if (new_clustered) {
 			if (ctx->old_table->fts) {
 				ut_ad(!ctx->old_table->fts->add_wq);
-				fts_optimize_remove_table(
-					ctx->old_table);
+				fts_optimize_remove_table(ctx->old_table);
 			}
+		}
 
-			if (ctx->new_table->fts) {
-				ut_ad(!ctx->new_table->fts->add_wq);
-				fts_optimize_remove_table(
-					ctx->new_table);
-			}
+		if (ctx->new_table->fts) {
+			ut_ad(!ctx->new_table->fts->add_wq);
+			fts_optimize_remove_table(ctx->new_table);
 		}
 	}
 
@@ -8395,9 +8448,13 @@ ha_innobase::commit_inplace_alter_table(
 
 		DBUG_ASSERT(new_clustered == ctx->need_rebuild());
 
-		ctx->max_autoinc = commit_get_autoinc(
-			ha_alter_info, ctx, altered_table, table);
-
+		if (commit_get_autoinc(ha_alter_info, ctx, altered_table,
+			table)) {
+			fail = true;
+			my_error(ER_TABLESPACE_DISCARDED, MYF(0),
+				 table->s->table_name.str);
+			goto rollback_trx;
+		}
 		if (ctx->need_rebuild()) {
 			ctx->tmp_name = dict_mem_create_temporary_tablename(
 				ctx->heap, ctx->new_table->name.m_name,
@@ -8430,7 +8487,7 @@ ha_innobase::commit_inplace_alter_table(
 		}
 #endif
 	}
-
+rollback_trx:
 	/* Commit or roll back the changes to the data dictionary. */
 
 	if (fail) {
@@ -8566,47 +8623,43 @@ ha_innobase::commit_inplace_alter_table(
 			continue;
 		}
 
-	/* Make a concurrent Drop fts Index to wait until sync of that
-	fts index is happening in the background */
-	for (;;) {
-                bool    retry = false;
+		/* Make a concurrent Drop fts Index to wait until sync of that
+		fts index is happening in the background */
+		for (int retry_count = 0;;) {
+			bool	retry = false;
 
-                for (inplace_alter_handler_ctx** pctx = ctx_array;
-                     *pctx; pctx++) {
-			int count =0;
-                        ha_innobase_inplace_ctx*        ctx
-                                = static_cast<ha_innobase_inplace_ctx*>(*pctx);
+			for (inplace_alter_handler_ctx** pctx = ctx_array; *pctx; pctx++) {
+				ha_innobase_inplace_ctx* ctx
+					= static_cast<ha_innobase_inplace_ctx*>(*pctx);
 
-                        DBUG_ASSERT(new_clustered == ctx->need_rebuild());
-			if (dict_fts_index_syncing(ctx->old_table)) {
-				count++;
-				if (count == 100) {
-					ib::info() <<
-					 "Drop index waiting for background sync"
-					 "to finish\n";
+				DBUG_ASSERT(new_clustered == ctx->need_rebuild());
+
+				if (dict_fts_index_syncing(ctx->old_table)) {
+					retry = true;
+					break;
 				}
-				retry = true;
+
+				if (new_clustered && dict_fts_index_syncing(ctx->new_table)) {
+					retry = true;
+					break;
+				}
 			}
 
-			if (new_clustered && dict_fts_index_syncing(ctx->new_table)) {
-				count++;
-				if (count == 100) {
-                                        ib::info() <<
-                                         "Drop index waiting for background sync"
-                                         "to finish\n";
-                                }
+			if (!retry) {
+				break;
+			}
 
-                                retry = true;
-                        }
+			/* Print a message if waiting for a long time. */
+			if (retry_count < 100) {
+				retry_count++;
+			} else {
+				ib::info() <<
+					"Drop index waiting for background sync to finish\n";
+				retry_count = 0;
+			}
 
+			DICT_BG_YIELD(trx);
 		}
-
-                if (!retry) {
-                        break;
-                }
-
-                DICT_BG_YIELD(trx);
-        }
 
 		innobase_copy_frm_flags_from_table_share(
 			ctx->new_table, altered_table->s);
@@ -8704,6 +8757,11 @@ foreign_fail:
 			ut_a(fts_check_cached_index(ctx->old_table));
 			DBUG_INJECT_CRASH("ib_commit_inplace_crash_fail",
 					  crash_fail_inject_count++);
+
+			/* Restart the FTS background operations. */
+			if (ctx->old_table->fts) {
+				fts_optimize_add_table(ctx->old_table);
+			}
 		}
 
 		row_mysql_unlock_data_dictionary(trx);
@@ -8781,8 +8839,6 @@ foreign_fail:
 			dict_table_autoinc_unlock(t);
 		}
 
-		bool	add_fts	= false;
-
 		/* Publish the created fulltext index, if any.
 		Note that a fulltext index can be created without
 		creating the clustered index, if there already exists
@@ -8797,14 +8853,14 @@ foreign_fail:
 				is left unset when a drop proceeds the add. */
 				DICT_TF2_FLAG_SET(ctx->new_table, DICT_TF2_FTS);
 				fts_add_index(index, ctx->new_table);
-				add_fts = true;
 			}
 		}
 
 		ut_d(dict_table_check_for_dup_indexes(
 			     ctx->new_table, CHECK_ALL_COMPLETE));
 
-		if (add_fts) {
+		/* Start/Restart the FTS background operations. */
+		if (ctx->new_table->fts) {
 			fts_optimize_add_table(ctx->new_table);
 		}
 
@@ -8832,7 +8888,8 @@ foreign_fail:
 				DBUG_SET("+d,innodb_report_deadlock");
 			);
 
-			if (dict_stats_drop_table(
+			if (dict_stats_is_persistent_enabled(ctx->new_table) &&
+				dict_stats_drop_table(
 				    ctx->new_table->name.m_name,
 				    errstr, sizeof(errstr))
 			    != DB_SUCCESS) {

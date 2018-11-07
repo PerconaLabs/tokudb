@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, 2009 Google Inc.
 Copyright (c) 2009, 2016, Percona Inc.
 
@@ -64,6 +64,7 @@ Created 10/8/1995 Heikki Tuuri
 #include "que0que.h"
 #include "row0mysql.h"
 #include "row0trunc.h"
+#include "row0log.h"
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
@@ -154,6 +155,16 @@ unsigned long long	srv_max_undo_log_size;
 /** UNDO logs that are not redo logged.
 These logs reside in the temp tablespace.*/
 const ulong		srv_tmp_undo_logs = 32;
+
+/** Enable or disable encryption of temporary tablespace.*/
+my_bool	srv_tmp_tablespace_encrypt;
+
+/** Option to enable encryption of system tablespace. */
+my_bool	srv_sys_tablespace_encrypt;
+
+/** Enable or disable encryption of pages in parallel doublewrite buffer
+file */
+my_bool	srv_parallel_dblwr_encrypt;
 
 /** Default undo tablespace size in UNIV_PAGEs count (10MB). */
 const ulint SRV_UNDO_TABLESPACE_SIZE_IN_PAGES =
@@ -268,7 +279,7 @@ const ulint	srv_buf_pool_min_size	= 5 * 1024 * 1024;
 const ulint	srv_buf_pool_def_size	= 128 * 1024 * 1024;
 /** Requested buffer pool chunk size. Each buffer pool instance consists
 of one or more chunks. */
-ulong	srv_buf_pool_chunk_unit;
+ulonglong	srv_buf_pool_chunk_unit;
 /** Requested number of buffer pool instances */
 ulong	srv_buf_pool_instances;
 /** Default number of buffer pool instances */
@@ -396,6 +407,8 @@ ulong	srv_n_purge_threads = 4;
 
 /* the number of pages to purge in one batch */
 ulong	srv_purge_batch_size = 20;
+
+ulong srv_encrypt_tables = 0;
 
 /* Internal setting for "innodb_stats_method". Decides how InnoDB treats
 NULL value when collecting statistics. By default, it is set to
@@ -1766,6 +1779,18 @@ srv_export_innodb_status(void)
 
 	export_vars.innodb_available_undo_logs = srv_available_undo_logs;
 
+	export_vars.innodb_n_merge_blocks_encrypted =
+		srv_stats.n_merge_blocks_encrypted;
+
+	export_vars.innodb_n_merge_blocks_decrypted =
+		srv_stats.n_merge_blocks_decrypted;
+
+	export_vars.innodb_n_rowlog_blocks_encrypted =
+		srv_stats.n_rowlog_blocks_encrypted;
+
+	export_vars.innodb_n_rowlog_blocks_decrypted =
+		srv_stats.n_rowlog_blocks_decrypted;
+
 #ifdef UNIV_DEBUG
 	rw_lock_s_lock(&purge_sys->latch);
 	trx_id_t	up_limit_id;
@@ -2673,6 +2698,45 @@ func_exit:
 	}
 
 	return(n_bytes_merged || n_tables_to_drop);
+}
+
+/** Set temporary tablespace to be encrypted if global variable
+innodb_temp_tablespace_encrypt is TRUE
+@param[in]	enable	true to enable encryption, false to disable
+@return DB_SUCCESS on success, DB_ERROR on failure */
+dberr_t
+srv_temp_encryption_update(bool enable)
+{
+	ut_ad(!srv_read_only_mode);
+
+	fil_space_t*	space = fil_space_get(srv_tmp_space.space_id());
+	bool		is_encrypted = FSP_FLAGS_GET_ENCRYPTION(space->flags);
+
+	ut_ad(fsp_is_system_temporary(space->id));
+
+	if (enable) {
+
+		if (is_encrypted) {
+			/* Encryption already enabled */
+			return(DB_SUCCESS);
+		} else {
+			/* Enable encryption now */
+			dberr_t err = fil_temp_update_encryption(space);
+			if (err == DB_SUCCESS) {
+				srv_tmp_space.set_flags(space->flags);
+			}
+			return(err);
+		}
+
+	} else {
+		if (!is_encrypted) {
+			/* Encryption already disabled */
+			return(DB_SUCCESS);
+		} else {
+			// TODO: Disabling encryption is not allowed yet
+			return(DB_SUCCESS);
+		}
+	}
 }
 
 /*********************************************************************//**

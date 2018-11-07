@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, 2016, Percona Inc.
 
 Portions of this file contain modifications contributed and copyrighted
@@ -213,6 +213,8 @@ mysql_pfs_key_t  innodb_parallel_dblwrite_file_key;
 
 /** The asynchronous I/O context */
 struct Slot {
+	Slot() { memset(this, 0, sizeof(*this)); }
+
 	/** index of the slot in the aio array */
 	uint16_t		pos;
 
@@ -2110,6 +2112,8 @@ os_file_compress_page(
 		old_compressed_len = ut_calc_align(
 			old_compressed_len + FIL_PAGE_DATA,
 			type.block_size());
+	} else {
+		old_compressed_len = *n;
 	}
 
 	byte*	compressed_page;
@@ -2750,6 +2754,8 @@ AIO::os_aio_dispatch_read_array_submit_low(
 	if (acquire_mutex)
 		array->acquire();
 	/* Submit aio requests buffered on all segments. */
+	ut_ad(array->m_pending);
+	ut_ad(array->m_count);
 	for (ulint i = 0; i < array->m_n_segments; i++) {
 		const int	count = array->m_count[i];
 		int	offset = 0;
@@ -2841,9 +2847,11 @@ AIO::linux_dispatch(Slot* slot, bool should_buffer)
 		in the pending array consecutively as they come.
 		m_count[i] records the number of buffered aio requests
 		in the ith segment.*/
+		ut_ad(m_count);
 		ulint&	count = m_count[io_ctx_index];
 		ut_ad(count != slots_per_segment);
 		ulint	n = io_ctx_index * slots_per_segment + count;
+		ut_ad(m_pending);
 		m_pending[n] = iocb;
 		++count;
 		if (count == slots_per_segment) {
@@ -3186,9 +3194,7 @@ os_file_get_last_error_low(
 		}
 		break;
 	case EINTR:
-		if (srv_use_native_aio) {
-			return(OS_FILE_AIO_INTERRUPTED);
-		}
+		return(OS_FILE_AIO_INTERRUPTED);
 		break;
 	case EACCES:
 		return(OS_FILE_ACCESS_VIOLATION);
@@ -3237,20 +3243,8 @@ os_file_fsync_posix(
 
 		case EIO:
 
-			++failures;
-			ut_a(failures < 1000);
-
-			if (!(failures % 100)) {
-
-				ib::warn()
-					<< "fsync(): "
-					<< "An error occurred during "
-					<< "synchronization,"
-					<< " retrying";
-			}
-
-			/* 0.2 sec */
-			os_thread_sleep(200000);
+                        ib::fatal()
+				<< "fsync() returned EIO, aborting.";
 			break;
 
 		case EINTR:
@@ -3290,7 +3284,8 @@ os_file_status_posix(
 	if (!ret) {
 		/* file exists, everything OK */
 
-	} else if (errno == ENOENT || errno == ENOTDIR) {
+	} else if (errno == ENOENT || errno == ENOTDIR
+		   || errno == ENAMETOOLONG) {
 		/* file does not exist */
 		return(true);
 
@@ -3449,15 +3444,10 @@ os_file_create_simple_func(
 		if (file.m_file == -1) {
 			*success = false;
 
-			if (errno == EINTR) {
-				/* Handle signal interruptions correctly */
-				retry = true;
-			} else {
-				retry = os_file_handle_error(
-					name,
-					create_mode == OS_FILE_OPEN
-					? "open" : "create");
-			}
+			retry = os_file_handle_error(
+				name,
+				create_mode == OS_FILE_OPEN
+				? "open" : "create");
 		} else {
 			*success = true;
 			retry = false;
@@ -4403,7 +4393,8 @@ os_file_status_win32(
 	if (!ret) {
 		/* file exists, everything OK */
 
-	} else if (errno == ENOENT || errno == ENOTDIR) {
+	} else if (errno == ENOENT || errno == ENOTDIR
+		  || errno == ENAMETOOLONG) {
 		/* file does not exist */
 		return(true);
 
@@ -5855,23 +5846,9 @@ os_file_pread(
 	trx_t*		trx,
 	dberr_t*	err)
 {
-	ulint		sec;
-	ulint		ms;
-	ib_uint64_t	start_time;
-	ib_uint64_t	finish_time;
-
 	++os_n_file_reads;
 
-	if (UNIV_LIKELY_NULL(trx))
-	{
-		ut_ad(trx->take_stats);
-		trx->io_reads++;
-		trx->io_read += n;
-		ut_usectime(&sec, &ms);
-		start_time = (ib_uint64_t)sec * 1000000 + ms;
-	} else {
-		start_time = 0;
-	}
+	const ib_uint64_t start_time = trx_stats::start_io_read(trx, n);
 
 	(void) os_atomic_increment_ulint(&os_n_pending_reads, 1);
 	MONITOR_ATOMIC_INC(MONITOR_OS_PENDING_READS);
@@ -5882,12 +5859,7 @@ os_file_pread(
 			n_bytes = -1;
 			errno = EINVAL;);
 
-	if (UNIV_UNLIKELY(start_time != 0))
-	{
-		ut_usectime(&sec, &ms);
-		finish_time = (ib_uint64_t)sec * 1000000 + ms;
-		trx->io_reads_wait_timer += (ulint)(finish_time - start_time);
-	}
+	trx_stats::end_io_read(trx, start_time);
 
 	(void) os_atomic_decrement_ulint(&os_n_pending_reads, 1);
 	MONITOR_ATOMIC_DEC(MONITOR_OS_PENDING_READS);
@@ -5918,7 +5890,6 @@ os_file_read_page(
 	trx_t*		trx)
 {
 	dberr_t		err;
-	ut_ad(!trx || trx->take_stats);
 
 	os_bytes_read_since_printout += n;
 
@@ -6328,7 +6299,6 @@ os_file_read_func(
 	trx_t*		trx)
 {
 	ut_ad(type.is_read());
-	ut_ad(!trx || trx->take_stats);
 
 	return(os_file_read_page(type, file, buf, offset, n, NULL, true, trx));
 }
@@ -6578,6 +6548,8 @@ AIO::AIO(
 # ifdef LINUX_NATIVE_AIO
 	,m_aio_ctx(),
 	m_events(m_slots.size())
+	,m_pending(NULL)
+	,m_count(NULL)
 # elif defined(_WIN32)
 	,m_handles()
 # endif /* LINUX_NATIVE_AIO */
@@ -6590,7 +6562,7 @@ AIO::AIO(
 	m_not_full = os_event_create("aio_not_full");
 	m_is_empty = os_event_create("aio_is_empty");
 
-	memset(&m_slots[0], 0x0, sizeof(m_slots[0]) * m_slots.size());
+	std::uninitialized_fill(m_slots.begin(), m_slots.end(), Slot());
 #ifdef LINUX_NATIVE_AIO
 	memset(&m_events[0], 0x0, sizeof(m_events[0]) * m_events.size());
 #endif /* LINUX_NATIVE_AIO */
@@ -6759,10 +6731,14 @@ AIO::~AIO()
 		m_events.clear();
 		ut_free(m_aio_ctx);
 #ifdef UNIV_DEBUG
-		for (size_t idx = 0; idx < m_slots.size(); ++idx)
-			ut_ad(m_pending[idx] == NULL);
-		for (size_t idx = 0; idx < m_n_segments; ++idx)
-			ut_ad(m_count[idx] == 0);
+		if (m_pending) {
+			for (size_t idx = 0; idx < m_slots.size(); ++idx)
+				ut_ad(m_pending[idx] == NULL);
+		}
+		if (m_count) {
+			for (size_t idx = 0; idx < m_n_segments; ++idx)
+				ut_ad(m_count[idx] == 0);
+		}
 #endif
 		ut_free(m_pending);
 		ut_free(m_count);
@@ -7307,7 +7283,7 @@ AIO::reserve_slot(
 #else
 		slot->len = static_cast<ulint>(compressed_len);
 #endif /* _WIN32 */
-		slot->skip_punch_hole = type.punch_hole();
+		slot->skip_punch_hole = !type.punch_hole();
 
 		acquire();
 	}
@@ -7730,7 +7706,6 @@ os_aio_func(
 	BOOL		ret = TRUE;
 #endif /* WIN_ASYNC_IO */
 
-	ut_ad(!trx || trx->take_stats);
 	ut_ad(n > 0);
 	ut_ad((n % OS_FILE_LOG_BLOCK_SIZE) == 0);
 	ut_ad((offset % OS_FILE_LOG_BLOCK_SIZE) == 0);
@@ -7779,12 +7754,7 @@ try_again:
 				   space_id);
 
 	if (type.is_read()) {
-
-		if (trx)
-		{
-			trx->io_reads++;
-			trx->io_read += n;
-		}
+		trx_stats::bump_io_read(trx, n);
 
 		if (srv_use_native_aio) {
 
@@ -9656,6 +9626,145 @@ Encryption::decrypt(
 
 	return(DB_SUCCESS);
 }
+
+#ifndef UNIV_INNOCHECKSUM
+
+/** Default master key for bootstrap */
+static const char ENCRYPTION_DEFAULT_MASTER_KEY[] = "DefaultMasterKey";
+
+/** Check if keyring plugin loaded. */
+bool Encryption::check_keyring()
+{
+	char	key_name[ENCRYPTION_MASTER_KEY_NAME_MAX_LEN];
+	memset(key_name, 0, ENCRYPTION_KEY_LEN);
+	strcpy(key_name, ENCRYPTION_DEFAULT_MASTER_KEY);
+
+	/* We call key ring API to generate master key here. */
+	int	my_ret = my_key_generate(key_name, "AES",
+					 NULL, ENCRYPTION_KEY_LEN);
+
+	/* We call key ring API to get master key here. */
+	if (my_ret != 0) {
+		char*	key_type = NULL;
+		char*	master_key = NULL;
+		size_t	key_len;
+		my_ret = my_key_fetch(key_name, &key_type, NULL,
+				      reinterpret_cast<void**>(&master_key),
+				      &key_len);
+
+		my_free(key_type);
+		my_free(master_key);
+	}
+
+	if (my_ret) {
+		ib::error() << "keyring error: please check that a"
+			       " keyring plugin is loaded.";
+	} else {
+		my_key_remove(key_name, NULL);
+		return(true);
+	}
+
+	return(false);
+}
+
+/** Encrypt a doublewrite buffer page. The page is encrypted
+using the key of tablespace object provided.
+Caller should allocate buffer for encrypted page
+@param[in]	space			tablespace object
+@param[in]	in_page			unencrypted page
+@param[in,out]	encrypted_buf		buffer to hold the encrypted page
+@param[in]	encrypted_buf_len	length of the encrypted buffer
+@return true on success, false on failure */
+bool
+os_dblwr_encrypt_page(
+	fil_space_t*	space,
+	page_t*		in_page,
+	page_t*		encrypted_buf,
+	ulint		encrypted_buf_len)
+{
+	if (!FSP_FLAGS_GET_ENCRYPTION(space->flags)) {
+		return(false);
+	}
+
+	IORequest	write_request(IORequest::WRITE);
+	page_size_t	page_size(space->flags);
+
+	write_request.encryption_key(
+		space->encryption_key,
+		space->encryption_klen,
+		space->encryption_iv);
+	write_request.encryption_algorithm(
+		Encryption::AES);
+
+	ulint 	bytes = page_size.physical();
+
+	/* After successful encryption, in_page will point
+	to a new memory block which is encrypted and
+	the bytes will have value of length of encrypted data */
+	void*	in_page_before	= in_page;
+	Block*	block = os_file_encrypt_page(
+		write_request,
+		in_page_before,
+		&bytes);
+
+	ut_ad(block != NULL);
+
+	if (in_page_before == in_page) {
+		os_free_block(block);
+		return(false);
+	}
+
+	ut_ad(bytes == page_size.physical());
+	ut_ad(bytes <= encrypted_buf_len);
+
+	memcpy(encrypted_buf, in_page_before /*encrypted page*/,
+	       bytes);
+
+	os_free_block(block);
+	return(true);
+}
+
+/** Decrypt a page from doublewrite buffer. Tablespace object
+(fil_space_t) must have encryption key, iv set properly.
+The decrpyted page will be written in the same buffer of input page.
+@param[in]	space	tablespace obejct
+@param[in,out]	page	in: encrypted page
+			out: decrypted page
+@return DB_SUCCESS on success, others on failure */
+dberr_t
+os_dblwr_decrypt_page(
+	fil_space_t*		space,
+	page_t*			page)
+{
+	if (!FSP_FLAGS_GET_ENCRYPTION(space->flags)) {
+		return(DB_SUCCESS);
+	}
+
+	page_size_t	page_size(space->flags);
+
+	IORequest	decrypt_request;
+
+	decrypt_request.encryption_key(
+			space->encryption_key,
+			space->encryption_klen,
+			space->encryption_iv);
+
+	decrypt_request.encryption_algorithm(
+		Encryption::AES);
+
+	Encryption	encryption(
+		decrypt_request.encryption_algorithm());
+
+	dberr_t	err = encryption.decrypt(
+		decrypt_request,
+		page, page_size.physical(), NULL,
+		page_size.physical());
+
+	ut_ad(err == DB_SUCCESS);
+	return(err);
+}
+
+#endif
 
 /** Normalizes a directory path for the current OS:
 On Windows, we convert '/' to '\', else we convert '\' to '/'.

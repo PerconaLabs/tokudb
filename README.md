@@ -10,6 +10,9 @@ Documentation: http://www.percona.com/doc/percona-server/5.7
 
 Launchpad (bugs, milestones, branches): http://launchpad.net/percona-server
 
+Bug Tracker: https://jira.percona.com/projects/PS
+
+Sources: https://github.com/percona/percona-server
 
 Code status:
 ------------
